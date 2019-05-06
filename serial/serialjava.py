@@ -1,251 +1,272 @@
-#!jython
-#
-# Backend Jython with JavaComm
-#
-# This file is part of pySerial. https://github.com/pyserial/pyserial
-# (C) 2002-2015 Chris Liechti <cliechti@gmx.net>
-#
-# SPDX-License-Identifier:    BSD-3-Clause
+'''
+Created on Dec 1, 2016
+Kivy serial port driver for Android. 
+A pyjnius port of usb-serial-for-android
+License MIT
+@author: frmdstryr@gmail.com
+'''
+from jnius import autoclass, cast
+from serial.serialutil import SerialBase, SerialException, SerialTimeoutException
 
-from __future__ import absolute_import
+UsbConstants = autoclass('android.hardware.usb.UsbConstants')
+Context = autoclass('org.kivy.android.PythonActivity')
+ByteBuffer = autoclass('java.nio.ByteBuffer')
+UsbRequest = autoclass('android.hardware.usb.UsbRequest')
+PendingIntent = autoclass('android.app.PendingIntent')
 
-from serial.serialutil import *
+import logging
+log = logging.getLogger("kivy")
 
-
-def my_import(name):
-    mod = __import__(name)
-    components = name.split('.')
-    for comp in components[1:]:
-        mod = getattr(mod, comp)
-    return mod
-
-
-def detect_java_comm(names):
-    """try given list of modules and return that imports"""
-    for name in names:
-        try:
-            mod = my_import(name)
-            mod.SerialPort
-            return mod
-        except (ImportError, AttributeError):
-            pass
-    raise ImportError("No Java Communications API implementation found")
-
-
-# Java Communications API implementations
-# http://mho.republika.pl/java/comm/
-
-comm = detect_java_comm([
-    'javax.comm',  # Sun/IBM
-    'gnu.io',      # RXTX
-])
-
-
-def device(portnumber):
-    """Turn a port number into a device name"""
-    enum = comm.CommPortIdentifier.getPortIdentifiers()
-    ports = []
-    while enum.hasMoreElements():
-        el = enum.nextElement()
-        if el.getPortType() == comm.CommPortIdentifier.PORT_SERIAL:
-            ports.append(el)
-    return ports[portnumber].getName()
-
-
-class Serial(SerialBase):
-    """\
-    Serial port class, implemented with Java Communications API and
-    thus usable with jython and the appropriate java extension.
+class CdcAcmSerialPort(SerialBase):
     """
+    For this to work you must request permission using an intent
+    filter:
+    
+    https://developer.android.com/guide/topics/connectivity/usb/host.html  
+    
+    """
+    USB_RECIP_INTERFACE = 0x01
+    USB_RT_ACM = UsbConstants.USB_TYPE_CLASS | USB_RECIP_INTERFACE
 
+    SET_LINE_CODING = 0x20  # USB CDC 1.1 section 6.2
+    GET_LINE_CODING = 0x21
+    SET_CONTROL_LINE_STATE = 0x22
+    SEND_BREAK = 0x23
+    
+    STOPBIT_MAP = {
+            1:0,
+            1.5:1,
+            2:2,
+    }
+    PARITY_MAP = {
+        'N':0,
+        'O':1,
+        'E':2,
+        'M':3,
+        'S':4
+    }
+    
+    #: Use async reads required for build > jellybean
+    ASYNC = False
+    
+    _requested_permission = False
+    
+    #: USB connection
+    _connection = None
+    
+    #: Timeout for sync reads does ASYNC does NOT use a timeout, it blocks (seems stupid)
+    DEFAULT_TIMEOUT = 1000
+    
     def open(self):
-        """\
-        Open port with current settings. This may throw a SerialException
-        if the port cannot be opened.
-        """
-        if self._port is None:
-            raise SerialException("Port must be configured before it can be used.")
-        if self.is_open:
-            raise SerialException("Port is already open.")
-        if type(self._port) == type(''):      # strings are taken directly
-            portId = comm.CommPortIdentifier.getPortIdentifier(self._port)
+        self.close()
+        
+        activity = cast('android.content.Context',Context.mActivity)
+        manager = activity.getSystemService("usb")
+        device = None
+        log.info("UsbDevices: {}".format(manager.getDeviceList().values().toArray()))
+        for device in manager.getDeviceList().values().toArray():
+            if device:# and device.getDeviceName()==self.portstr:
+                log.info("Found device {}".format(device.getDeviceName()))
+                break
+        if not device:
+            raise SerialException("Device not present {}".format(self.portstr))
+        
+        connection = manager.openDevice(device)
+        if not connection:
+            #if not CdcAcmSerialPort._requested_permission:
+            #    intent = PendingIntent()
+            #    manager.requestPermission(device,intent)
+            raise SerialException("Failed to open device!")
+                
+        log.info("UsbDevice connection made {}!".format(connection))
+            
+        self._device = device
+        self._connection = connection
+        
+        if device.getInterfaceCount()==1:
+            log.debug("device might be castrated ACM device, trying single interface logic")
+            self._open_single_interface()
         else:
-            portId = comm.CommPortIdentifier.getPortIdentifier(device(self._port))     # numbers are transformed to a comport id obj
-        try:
-            self.sPort = portId.open("python serial module", 10)
-        except Exception as msg:
-            self.sPort = None
-            raise SerialException("Could not open port: %s" % msg)
-        self._reconfigurePort()
-        self._instream = self.sPort.getInputStream()
-        self._outstream = self.sPort.getOutputStream()
-        self.is_open = True
+            log.debug("trying default interface logic") 
+            self._open_interface()
+        
+        #: Check that all endpoints are good
+        if None in [self._control_endpoint,
+                        self._write_endpoint,
+                        self._read_endpoint]:
+            msg = "Could not establish all endpoints"
+            log.debug(msg)
+            raise SerialException(msg)
+        
+        return self.fd
+    
+    def _open_single_interface(self):
+        self._control_interface = self._device.getInterface(0)
+        log.debug("Control iface={}".format(self._control_interface))
+        self._data_interface = self._device.getInterface(0)
+        log.debug("Data iface={}".format(self._data_interface))
+        
+        if not self._connection.claimInterface(self._control_interface,True):
+            raise SerialException("Could not claim shared control/data interface.")
+        
+        num_endpoints = self._control_interface.getEndpointCount()
+        if num_endpoints < 3:
+            msg = "not enough endpoints - need 3, got {}".format(num_endpoints)
+            log.error(msg)
+            raise SerialException(msg)
+        
+        for i in range(num_endpoints):
+            ep = self._control_interface.getEndpoint(i)
+            if ((ep.getDirection() == UsbConstants.USB_DIR_IN) and
+                (ep.getType() == UsbConstants.USB_ENDPOINT_XFER_INT)):
+                log.debug("Found controlling endpoint")
+                self._control_endpoint = ep
+            elif ((ep.getDirection() == UsbConstants.USB_DIR_IN) and
+                (ep.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK)):
+                log.debug("Found reading endpoint")
+                self._read_endpoint = ep
+            elif ((ep.getDirection() == UsbConstants.USB_DIR_OUT) and
+                (ep.getType() == UsbConstants.USB_ENDPOINT_XFER_BULK)):
+                log.debug("Found writing endpoint")
+                self._write_endpoint = ep  
+                
+            if None not in [self._control_endpoint,
+                        self._write_endpoint,
+                        self._read_endpoint]:
+                log.debug("Found all endpoints")
+                break
+        
+    
+    def _open_interface(self):
+        device = self._device
+        log.debug("claiming interfaces, count={}".format(
+            device.getInterfaceCount()))
+        
+        self._control_interface = device.getInterface(0)
+        log.debug("Control iface={}".format(self._control_interface))
 
-    def _reconfigurePort(self):
-        """Set communication parameters on opened port."""
-        if not self.sPort:
-            raise SerialException("Can only operate on a valid port handle")
-
-        self.sPort.enableReceiveTimeout(30)
-        if self._bytesize == FIVEBITS:
-            jdatabits = comm.SerialPort.DATABITS_5
-        elif self._bytesize == SIXBITS:
-            jdatabits = comm.SerialPort.DATABITS_6
-        elif self._bytesize == SEVENBITS:
-            jdatabits = comm.SerialPort.DATABITS_7
-        elif self._bytesize == EIGHTBITS:
-            jdatabits = comm.SerialPort.DATABITS_8
-        else:
-            raise ValueError("unsupported bytesize: %r" % self._bytesize)
-
-        if self._stopbits == STOPBITS_ONE:
-            jstopbits = comm.SerialPort.STOPBITS_1
-        elif self._stopbits == STOPBITS_ONE_POINT_FIVE:
-            jstopbits = comm.SerialPort.STOPBITS_1_5
-        elif self._stopbits == STOPBITS_TWO:
-            jstopbits = comm.SerialPort.STOPBITS_2
-        else:
-            raise ValueError("unsupported number of stopbits: %r" % self._stopbits)
-
-        if self._parity == PARITY_NONE:
-            jparity = comm.SerialPort.PARITY_NONE
-        elif self._parity == PARITY_EVEN:
-            jparity = comm.SerialPort.PARITY_EVEN
-        elif self._parity == PARITY_ODD:
-            jparity = comm.SerialPort.PARITY_ODD
-        elif self._parity == PARITY_MARK:
-            jparity = comm.SerialPort.PARITY_MARK
-        elif self._parity == PARITY_SPACE:
-            jparity = comm.SerialPort.PARITY_SPACE
-        else:
-            raise ValueError("unsupported parity type: %r" % self._parity)
-
-        jflowin = jflowout = 0
-        if self._rtscts:
-            jflowin |= comm.SerialPort.FLOWCONTROL_RTSCTS_IN
-            jflowout |= comm.SerialPort.FLOWCONTROL_RTSCTS_OUT
-        if self._xonxoff:
-            jflowin |= comm.SerialPort.FLOWCONTROL_XONXOFF_IN
-            jflowout |= comm.SerialPort.FLOWCONTROL_XONXOFF_OUT
-
-        self.sPort.setSerialPortParams(self._baudrate, jdatabits, jstopbits, jparity)
-        self.sPort.setFlowControlMode(jflowin | jflowout)
-
-        if self._timeout >= 0:
-            self.sPort.enableReceiveTimeout(int(self._timeout*1000))
-        else:
-            self.sPort.disableReceiveTimeout()
-
-    def close(self):
-        """Close port"""
-        if self.is_open:
-            if self.sPort:
-                self._instream.close()
-                self._outstream.close()
-                self.sPort.close()
-                self.sPort = None
-            self.is_open = False
-
-    #  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -  -
-
+        if not self._connection.claimInterface(self._control_interface, True):
+            raise SerialException("Could not claim control interface")
+        
+        self._control_endpoint = self._control_interface.getEndpoint(0)
+        log.debug("Control endpoint direction: {}".format(
+            self._control_endpoint.getDirection()))
+        
+        log.debug("Claiming data interface.")
+        self._data_interface = device.getInterface(1)
+        log.debug("data iface={}".format(self._data_interface))
+        
+        if not self._connection.claimInterface(self._data_interface, True):
+            raise SerialException("Could not claim data interface")
+        
+        self._read_endpoint = self._data_interface.getEndpoint(1)
+        log.debug("Read endpoint direction: {}".format(
+            self._read_endpoint.getDirection()))
+        
+        self._write_endpoint = self._data_interface.getEndpoint(0)
+        log.debug("Write endpoint direction: {}".format(
+            self._write_endpoint.getDirection()))
+        
+    def send_acm_control_message(self, request, value, buf=None):
+        return self._connection.controlTransfer(
+            self.USB_RT_ACM, request, value, 0, buf,
+            0 if buf is None else len(buf),
+            self._write_timeout
+        )
+        
+    def close(self, *args, **kwargs):
+        if self._connection:
+            self._connection.close()
+        self._connection = None
+        
+    def _reconfigure_port(self):
+        msg = bytearray([self._baudrate & 0xff,
+                         self._baudrate >> 8 & 0xff,
+                         self._baudrate >> 16 & 0xff,
+                         self._baudrate >> 24 & 0xff,
+                         self.STOPBIT_MAP[self._stopbits],
+                         self.PARITY_MAP[self._parity],
+                         self._bytesize
+                         ])
+        #: Set line coding
+        self.send_acm_control_message(self.SET_LINE_CODING, 0, msg)
+        
+        #: Set line state
+        value = (0x2 if self._rts_state else 0) or (0x1 if self._dtr_state else 0)
+        self.send_acm_control_message(self.SET_CONTROL_LINE_STATE, value)
+    
     @property
-    def in_waiting(self):
-        """Return the number of characters currently in the input buffer."""
-        if not self.sPort:
-            raise portNotOpenError
-        return self._instream.available()
-
-    def read(self, size=1):
-        """\
-        Read size bytes from the serial port. If a timeout is set it may
-        return less characters as requested. With no timeout it will block
-        until the requested number of bytes is read.
-        """
-        if not self.sPort:
-            raise portNotOpenError
-        read = bytearray()
-        if size > 0:
-            while len(read) < size:
-                x = self._instream.read()
-                if x == -1:
-                    if self.timeout >= 0:
-                        break
-                else:
-                    read.append(x)
-        return bytes(read)
-
-    def write(self, data):
-        """Output the given string over the serial port."""
-        if not self.sPort:
-            raise portNotOpenError
-        if not isinstance(data, (bytes, bytearray)):
-            raise TypeError('expected %s or bytearray, got %s' % (bytes, type(data)))
-        self._outstream.write(data)
-        return len(data)
-
+    def fd(self):
+        #: Warning... This does not seem to work with select :/
+        return self._connection.getFileDescriptor()
+    
     def reset_input_buffer(self):
-        """Clear input buffer, discarding all that is in the buffer."""
-        if not self.sPort:
-            raise portNotOpenError
-        self._instream.skip(self._instream.available())
-
+        #: Not implemented
+        pass
+    
     def reset_output_buffer(self):
-        """\
-        Clear output buffer, aborting the current output and
-        discarding all that is in the buffer.
-        """
-        if not self.sPort:
-            raise portNotOpenError
-        self._outstream.flush()
-
-    def send_break(self, duration=0.25):
-        """Send break condition. Timed, returns to idle state after given duration."""
-        if not self.sPort:
-            raise portNotOpenError
-        self.sPort.sendBreak(duration*1000.0)
-
-    def _update_break_state(self):
-        """Set break: Controls TXD. When active, to transmitting is possible."""
-        if self.fd is None:
-            raise portNotOpenError
-        raise SerialException("The _update_break_state function is not implemented in java.")
-
-    def _update_rts_state(self):
-        """Set terminal status line: Request To Send"""
-        if not self.sPort:
-            raise portNotOpenError
-        self.sPort.setRTS(self._rts_state)
-
-    def _update_dtr_state(self):
-        """Set terminal status line: Data Terminal Ready"""
-        if not self.sPort:
-            raise portNotOpenError
-        self.sPort.setDTR(self._dtr_state)
-
-    @property
-    def cts(self):
-        """Read terminal status line: Clear To Send"""
-        if not self.sPort:
-            raise portNotOpenError
-        self.sPort.isCTS()
-
-    @property
-    def dsr(self):
-        """Read terminal status line: Data Set Ready"""
-        if not self.sPort:
-            raise portNotOpenError
-        self.sPort.isDSR()
-
-    @property
-    def ri(self):
-        """Read terminal status line: Ring Indicator"""
-        if not self.sPort:
-            raise portNotOpenError
-        self.sPort.isRI()
-
-    @property
-    def cd(self):
-        """Read terminal status line: Carrier Detect"""
-        if not self.sPort:
-            raise portNotOpenError
-        self.sPort.isCD()
+        #: Not implemented
+        pass    
+    
+    def read(self, n):
+        if self.ASYNC:
+            data =  self._read_async(n)
+        else:
+            data = self._read_sync(n)
+        log.info("AndroidSerial: read data={}, len={}".format(data,len(data)))
+        return data
+         
+    def _read_async(self,n):
+        #: Warning this blocks until data comes or the connection drops
+        #: This should be done in an IO thread
+        req = UsbRequest()
+        try:
+            req.initialize(self._connection,self._read_endpoint)
+            buf = ByteBuffer.allocate(n)
+            if not req.queue(buf,n):
+                raise IOError("Error queuing request.")
+            #: Warning this response is not necessarily from the above request
+            #: see the docs
+            resp = self._connection.requestWait()
+             
+            if resp is None:
+                raise IOError("Null response")
+            return str(bytearray(buf.array()[0:buf.position()]))
+        finally:
+            req.close()
+        
+    def _read_sync(self,n):
+        buf = bytearray(n)
+        
+        timeout = int(self._timeout*1000 if self._timeout else self.DEFAULT_TIMEOUT)
+        log.info("AndroidSerial: read start n={},timeout={}".format(n,timeout))
+        num_read =  self._connection.bulkTransfer(self._read_endpoint,
+                                                  buf,
+                                                  n,
+                                                  timeout)
+        log.info("AndroidSerial: read done num_read={},buf={}".format(n,str(buf)))
+        if num_read<0:
+            raise SerialTimeoutException("Read timeout")
+        elif num_read==0:
+            return ''
+        return str(buf[0:num_read])
+            
+    def write(self, data, buffer_size=16*1024):
+        offset = 0
+        timeout = int(self._write_timeout*1000 if self._write_timeout else self.DEFAULT_TIMEOUT)
+        wrote = 0
+        log.info("AndroidSerial: write data={}, timeout={}".format(timeout,data))
+        while offset < len(data):
+            n = min(len(data)-offset,buffer_size)
+            buf = data[offset:offset+n]
+            i = self._connection.bulkTransfer(self._write_endpoint,
+                                              buf,
+                                              n,
+                                              timeout)
+            if i<=0:
+                raise IOError("Failed to write {}: {}".format(buf,i))
+            offset +=n
+            wrote += i
+        log.info("AndroidSerial: wrote {}".format(wrote))
+        return wrote
+        
